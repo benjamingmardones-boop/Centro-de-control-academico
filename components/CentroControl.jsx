@@ -109,7 +109,110 @@ function generateSessions(ev, subject) {
   }));
 }
 
-/* ========================= CALC ENGINE ========================= */
+/* ===================== IMPORTADOR DE SYLLABUS ===================== */
+const MESES_ES = {
+  enero: 1, febrero: 2, marzo: 3, abril: 4, mayo: 5, junio: 6,
+  julio: 7, agosto: 8, septiembre: 9, setiembre: 9, octubre: 10, noviembre: 11, diciembre: 12,
+};
+const TIPO_KEYWORDS = [
+  ["examen", "Examen"], ["certamen", "Prueba"], ["prueba", "Prueba"], ["control", "Control"],
+  ["taller", "Trabajo"], ["trabajo", "Trabajo"], ["exposici", "Exposición"], ["informe", "Trabajo"],
+  ["tarea", "Trabajo"], ["entrega", "Trabajo"], ["ensayo", "Trabajo"], ["laboratorio", "Trabajo"],
+];
+
+function pickYear(month, day) {
+  // Si esa fecha ya pasó hace mucho este año, probablemente es del próximo año (o viceversa).
+  const now = new Date();
+  const thisYear = now.getFullYear();
+  const candidate = new Date(thisYear, month - 1, day);
+  const diff = (candidate - now) / 86400000;
+  if (diff < -200) return thisYear + 1;
+  if (diff > 200) return thisYear - 1;
+  return thisYear;
+}
+function toISO(year, month, day) {
+  return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+}
+
+// Devuelve una lista de candidatos { date, rawLine, weight, type, matchedSubjectId }
+// a partir de texto libre (pegado o extraído de un PDF). Es heurístico — el usuario
+// revisa y corrige antes de importar, nunca se guarda nada automáticamente.
+function parseSyllabusText(text, subjects) {
+  const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  const results = [];
+  const dateNumRe = /\b(\d{1,2})[\/\-.](\d{1,2})(?:[\/\-.](\d{2,4}))?\b/;
+  const dateWordRe = /\b(\d{1,2})\s+de\s+([a-záéíóúñ]+)(?:\s+de\s+(\d{4}))?\b/i;
+
+  lines.forEach((line) => {
+    let m = line.match(dateNumRe);
+    let day, month, year;
+    if (m) {
+      day = parseInt(m[1], 10); month = parseInt(m[2], 10);
+      if (month > 12 && day <= 12) { [day, month] = [month, day]; } // por si viene mes/día
+      year = m[3] ? (m[3].length === 2 ? 2000 + parseInt(m[3], 10) : parseInt(m[3], 10)) : pickYear(month, day);
+    } else {
+      m = line.match(dateWordRe);
+      if (m) {
+        day = parseInt(m[1], 10);
+        const monthName = m[2].toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+        month = MESES_ES[monthName];
+        if (!month) return;
+        year = m[3] ? parseInt(m[3], 10) : pickYear(month, day);
+      }
+    }
+    if (!day || !month || month < 1 || month > 12 || day < 1 || day > 31) return;
+
+    const weightM = line.match(/(\d{1,3})\s*%/);
+    const weight = weightM ? Math.min(100, parseInt(weightM[1], 10)) : 20;
+
+    const lower = line.toLowerCase();
+    let type = "Prueba";
+    for (const [kw, label] of TIPO_KEYWORDS) { if (lower.includes(kw)) { type = label; break; } }
+
+    let matchedSubjectId = null;
+    for (const s of subjects) {
+      if (lower.includes(s.name.toLowerCase())) { matchedSubjectId = s.id; break; }
+    }
+
+    results.push({
+      id: uid(),
+      date: toISO(year, month, day),
+      rawLine: line,
+      name: line.replace(dateNumRe, "").replace(dateWordRe, "").replace(/\d{1,3}\s*%/, "").trim().replace(/^[-–—:•\s]+|[-–—:•\s]+$/g, "") || type,
+      type,
+      weight,
+      subjectId: matchedSubjectId,
+    });
+  });
+
+  // ordena por fecha y quita duplicados obvios (misma fecha + texto)
+  const seen = new Set();
+  return results
+    .sort((a, b) => (a.date < b.date ? -1 : 1))
+    .filter((r) => {
+      const key = r.date + "|" + r.rawLine;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+}
+
+async function extractPdfText(file) {
+  const pdfjsLib = await import("pdfjs-dist/legacy/build/pdf");
+  pdfjsLib.GlobalWorkerOptions.workerSrc =
+    "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.4.168/pdf.worker.min.mjs";
+  const buf = await file.arrayBuffer();
+  const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+  let text = "";
+  for (let i = 1; i <= pdf.numPages; i++) {
+    const page = await pdf.getPage(i);
+    const content = await page.getTextContent();
+    text += content.items.map((it) => it.str).join(" ") + "\n";
+  }
+  return text;
+}
+
+
 function subjectAverage(subjectId, evaluations) {
   const evs = evaluations.filter((e) => e.subjectId === subjectId && e.grade !== null && e.grade !== undefined);
   const totalW = evs.reduce((a, e) => a + Number(e.weight || 0), 0);
@@ -1049,6 +1152,106 @@ function SubjectModal({ palette, initial, onClose, onSave }) {
 function heading() { return { fontFamily: "Space Grotesk, sans-serif", fontSize: 19, margin: 0 }; }
 
 /* ============================== NOTAS ============================== */
+function ImportSyllabusModal({ palette, subjects, onClose, onImport }) {
+  const [text, setText] = useState("");
+  const [rows, setRows] = useState(null);
+  const [parsing, setParsing] = useState(false);
+  const [pdfError, setPdfError] = useState("");
+
+  const analyze = (rawText) => {
+    const found = parseSyllabusText(rawText, subjects);
+    setRows(found);
+  };
+
+  const onFile = async (file) => {
+    if (!file) return;
+    setPdfError("");
+    setParsing(true);
+    try {
+      const extracted = await extractPdfText(file);
+      setText(extracted);
+      analyze(extracted);
+    } catch (e) {
+      setPdfError("No se pudo leer ese PDF. Puedes copiar el texto del syllabus y pegarlo abajo en vez de subir el archivo.");
+    } finally {
+      setParsing(false);
+    }
+  };
+
+  const updateRow = (id, patch) => setRows((rs) => rs.map((r) => (r.id === id ? { ...r, ...patch } : r)));
+  const removeRow = (id) => setRows((rs) => rs.filter((r) => r.id !== id));
+
+  const readyCount = rows ? rows.filter((r) => r.subjectId).length : 0;
+
+  return (
+    <Modal title="Importar pruebas del syllabus" palette={palette} onClose={onClose} wide>
+      {!rows && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+          <div style={{ fontSize: 12.5, color: palette.textDim, lineHeight: 1.5 }}>
+            Sube el PDF del syllabus, o si prefieres, copia y pega aquí el texto con las fechas
+            (funciona con formatos como "18/08 Prueba de Funciones 30%" o "18 de agosto: Certamen 1").
+          </div>
+          <input type="file" accept="application/pdf" onChange={(e) => onFile(e.target.files?.[0])} style={{ fontSize: 12.5, color: palette.textDim }} />
+          {parsing && <div style={{ fontSize: 12, color: palette.amber }}>Leyendo el PDF…</div>}
+          {pdfError && <div style={{ fontSize: 12, color: palette.red }}>{pdfError}</div>}
+          <div style={{ fontSize: 11, color: palette.textDim, textAlign: "center" }}>— o —</div>
+          <textarea value={text} onChange={(e) => setText(e.target.value)} placeholder="Pega aquí el texto del syllabus…"
+            style={{ ...inputStyle(palette), minHeight: 160, fontFamily: "IBM Plex Mono, monospace", fontSize: 12 }} />
+          <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
+            <Btn palette={palette} variant="ghost" onClick={onClose}>Cancelar</Btn>
+            <Btn palette={palette} disabled={!text.trim()} onClick={() => analyze(text)}>Analizar</Btn>
+          </div>
+        </div>
+      )}
+
+      {rows && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          {rows.length === 0 ? (
+            <div style={{ fontSize: 13, color: palette.textDim }}>
+              No encontré fechas reconocibles en ese texto. Puedes volver atrás e intentar pegando el texto directamente,
+              o agregar las evaluaciones a mano desde "Nueva evaluación".
+            </div>
+          ) : (
+            <>
+              <div style={{ fontSize: 12, color: palette.textDim }}>
+                Encontré {rows.length} posible{rows.length === 1 ? "" : "s"} evaluación{rows.length === 1 ? "" : "es"}.
+                Revisa la asignatura de cada una (no las adivino todas) y quita las que no correspondan antes de importar.
+              </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 8, maxHeight: 360, overflowY: "auto" }}>
+                {rows.map((r) => (
+                  <div key={r.id} style={{ display: "grid", gridTemplateColumns: "110px 1fr 130px 70px auto", gap: 6, alignItems: "center",
+                    padding: 8, borderRadius: 10, background: palette.bgElev2 }}>
+                    <input type="date" value={r.date} onChange={(e) => updateRow(r.id, { date: e.target.value })} style={{ ...inputStyle(palette), fontSize: 11.5, padding: "6px 8px" }} />
+                    <input value={r.name} onChange={(e) => updateRow(r.id, { name: e.target.value })} style={{ ...inputStyle(palette), fontSize: 12, padding: "6px 8px" }} />
+                    <select value={r.subjectId || ""} onChange={(e) => updateRow(r.id, { subjectId: e.target.value || null })}
+                      style={{ ...inputStyle(palette), fontSize: 11.5, padding: "6px 6px", color: r.subjectId ? palette.text : palette.red }}>
+                      <option value="">Sin asignar</option>
+                      {subjects.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+                    </select>
+                    <input type="number" value={r.weight} onChange={(e) => updateRow(r.id, { weight: Number(e.target.value) })} style={{ ...inputStyle(palette), fontSize: 11.5, padding: "6px 6px" }} />
+                    <button onClick={() => removeRow(r.id)} style={iconBtn(palette, palette.red)}><Trash2 size={13} /></button>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 4 }}>
+            <Btn palette={palette} variant="ghost" onClick={() => setRows(null)}>Volver</Btn>
+            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              {rows.length > 0 && readyCount < rows.length && (
+                <span style={{ fontSize: 11, color: palette.amber }}>{rows.length - readyCount} sin asignatura asignada</span>
+              )}
+              <Btn palette={palette} disabled={readyCount === 0} onClick={() => onImport(rows.filter((r) => r.subjectId))}>
+                Importar {readyCount || ""} evaluaci{readyCount === 1 ? "ón" : "ones"}
+              </Btn>
+            </div>
+          </div>
+        </div>
+      )}
+    </Modal>
+  );
+}
+
 function Notas({ palette, subjects, evaluations, settings, upsertEvaluation, deleteEvaluation, askConfirm }) {
   const [editing, setEditing] = useState(null);
   const [calcSubject, setCalcSubject] = useState(subjects[0]?.id || "");
@@ -1057,13 +1260,17 @@ function Notas({ palette, subjects, evaluations, settings, upsertEvaluation, del
   const bySubject = subjects.map((s) => ({ subject: s, evs: evaluations.filter((e) => e.subjectId === s.id).sort((a, b) => a.date < b.date ? -1 : 1) }));
 
   const calc = calcSubject ? neededGrade(calcSubject, evaluations, calcTarget, settings.scaleMax) : null;
+  const [importing, setImporting] = useState(false);
   const calcSum = calcSubject ? subjectWeightedSum(calcSubject, evaluations) : null;
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
         <h2 style={heading()}>Notas y evaluaciones</h2>
-        <Btn palette={palette} onClick={() => setEditing({})}><Plus size={14} /> Nueva evaluación</Btn>
+        <div style={{ display: "flex", gap: 8 }}>
+          <Btn palette={palette} variant="ghost" onClick={() => setImporting(true)}><Plus size={14} /> Importar del syllabus</Btn>
+          <Btn palette={palette} onClick={() => setEditing({})}><Plus size={14} /> Nueva evaluación</Btn>
+        </div>
       </div>
 
       <Card palette={palette}>
@@ -1134,6 +1341,18 @@ function Notas({ palette, subjects, evaluations, settings, upsertEvaluation, del
       {editing && (
         <EvaluationModal palette={palette} subjects={subjects} initial={editing} onClose={() => setEditing(null)}
           onSave={(ev) => { upsertEvaluation(ev, !editing.id); setEditing(null); }} />
+      )}
+      {importing && (
+        <ImportSyllabusModal palette={palette} subjects={subjects} onClose={() => setImporting(false)}
+          onImport={(rows) => {
+            rows.forEach((r) => {
+              upsertEvaluation({
+                id: uid(), subjectId: r.subjectId, name: r.name, type: r.type,
+                date: r.date, weight: r.weight, grade: null, contents: "", notes: "",
+              }, true);
+            });
+            setImporting(false);
+          }} />
       )}
     </div>
   );
